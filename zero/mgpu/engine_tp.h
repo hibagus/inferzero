@@ -1076,6 +1076,17 @@ class TpEngine {
     }
     zrt::oom_throws = false;
     for (int r = 0; r < n; ++r) comm_.flags[r] = 0;
+    // (each GPU's host staging buffer (zrt::staging) at a prompt chunk's input now, one GPU at a time. Grown later,
+    //  during the first long prompt, the shards' threads allocated pinned host memory at the same moment, and on PVC
+    //  (4 GPUs, driver 25.18) zeMemAllocHost failed now and then with out of device memory, ARC_HOST_DIAG's stack
+    //  Engine::embed -> staging. ARC_TP_STAGE_PRE=0: as before)
+    static const bool stage_pre = !(getenv("ARC_TP_STAGE_PRE") && atoi(getenv("ARC_TP_STAGE_PRE")) == 0);
+    if (stage_pre && !sim)
+      for (int q = 0; q < n; ++q)
+        run_on({q}, [&](int r) {
+          const Engine& e = *shards_[r];
+          zrt::staging((size_t)e.max_chunk * std::max(e.hp.hce(), e.hp.n_embd) * 4);
+        });
     choose_sums(sim);
     size_t vocab = 0;
     for (int r = 0; r < n; ++r) vocab += (size_t)shards_[r]->n_logits();
