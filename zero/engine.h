@@ -1171,7 +1171,7 @@ __kernel void rd_block(__global const uint* p, __global uint* out, int per_item)
   // other, which sets the GEMV's floor once a launch has few rows (a GPU's share of a split model, a long-row down
   // projection), and a launch of just over one round of the GPU's T threads pays a second round. So: of G in {1, 2, 4}
   // and S in {1, 2, 4, 8} (S at most the row's steps), the most sub-groups N / G x S that fit in one round of T; ties
-  // to the larger S, then the larger G. Where nothing fits (N > 4T) G = 2, S = 2. Checked against every (G, S) with
+  // to the larger S, then the larger G. Where nothing fits (N > 4T) G = 1, S = 1. Checked against every (G, S) with
   // bench/gemv_bench (GB_TYPE, GB_N, GB_K) on a PVC stack for the matrices of a mixed-type 27B at the shares of 1, 2
   // and 4 GPUs. gemv and gemv_v, one token, dense models (not MoE), not the output head, the fused two-pass GEMV or
   // the probes; ARC_GEMV_ROWS overrides it
@@ -1188,7 +1188,7 @@ __kernel void rd_block(__global const uint* p, __global uint* out, int per_item)
         if (sg > t) continue;
         if (sg > best || (sg == best && (s > bs || (s == bs && g > bg)))) best = sg, bg = g, bs = s;
       }
-    if (best < 0) bg = 2, bs = steps >= 2 ? 2 : 1;  // (more rows than one round: 2 x 2, as many sub-groups as 1 x 1)
+    if (best < 0) bg = 1, bs = 1;  // (more rows than one round: as the wave rule; 2 x 2, faster in gemv_bench, lost in the model)
     grows = bg;
     split = bs;
     static const bool log = atoi(getenv("ARC_GEMV_SPLITK")) == 2;  // (=2: each shape's choice once in the log)
