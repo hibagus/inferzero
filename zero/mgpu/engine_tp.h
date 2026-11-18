@@ -61,8 +61,10 @@ struct TpComm {
   bool devsync = false;
   std::vector<uint32_t*> sem;   // per GPU: n words in its memory
   std::vector<uint32_t> dseq;   // per shard: the number of its last GPU-side sum (the same on every shard)
-  struct ZexWait { uint32_t stype; const void* pNext; uint32_t action; };
-  struct ZexWrite { uint32_t stype; const void* pNext; uint32_t scope; };
+  // (the driver's zex_wait_on_mem_desc_t / zex_write_to_mem_desc_t, level_zero/driver_experimental/zex_common.h: no
+  //  stype / pNext. Scopes: 1 sub-device, 2 device, 4 host; waits: 1 ==, 2 !=, 4 >, 8 >=, 16 <, 32 <=)
+  struct ZexWait { uint32_t action, scope; };
+  struct ZexWrite { uint32_t scope; };
   ze_result_t(__stdcall* zex_wait)(ze_command_list_handle_t, ZexWait*, void*, uint32_t, ze_event_handle_t) = nullptr;
   ze_result_t(__stdcall* zex_write)(ze_command_list_handle_t, ZexWrite*, void*, uint64_t) = nullptr;
   std::atomic<bool> failed{false};  // (a shard threw: the others leave their barrier instead of waiting forever)
@@ -341,10 +343,10 @@ inline void Engine::tp_reduce_at(int rows, const TpSum& a) {
     const uint32_t q = ++c.dseq[r];
     ze_command_list_handle_t l = zrt::imm();
     ZE_CHECK(zeCommandListAppendBarrier(l, nullptr, 0, nullptr));  // (the copies done before the numbers go out)
-    TpComm::ZexWrite wd{0, nullptr, 0x4 /* host scope: visible to the other GPU */};
+    TpComm::ZexWrite wd{0x4 /* host scope: visible to the other GPU */};
     for (int k = 0; k < c.n; ++k)
       if (k != r) ZE_CHECK(c.zex_write(l, &wd, c.sem[k] + r, (uint64_t)q));
-    TpComm::ZexWait wt{0, nullptr, 0x8 /* greater than or equal */};
+    TpComm::ZexWait wt{0x8 /* greater than or equal */, 0x4 /* host scope */};
     for (int k = 0; k < c.n; ++k)
       if (k != r) ZE_CHECK(c.zex_wait(l, &wt, c.sem[r] + k, q, nullptr));
   } else {
@@ -1333,8 +1335,8 @@ class TpEngine {
               ZE_CHECK(zeCommandListAppendMemoryFill(zrt::imm(), comm_.sem[r], &z, 4, 256, nullptr, 0, nullptr));
               zrt::sync();
               if (getenv("ARC_TP_DEVSYNC_DBG")) {  // (a diagnosis: does a wait on this word build here, and on a new list?)
-                TpComm::ZexWait wt{0, nullptr, 0x8};
-                TpComm::ZexWrite wd{0, nullptr, 0x4};
+                TpComm::ZexWait wt{0x8, 0x4};
+                TpComm::ZexWrite wd{0x4};
                 const ze_result_t a = comm_.zex_wait(zrt::imm(), &wt, comm_.sem[r] + 1, 0, nullptr);
                 const ze_result_t b = comm_.zex_write(zrt::imm(), &wd, comm_.sem[r] + 1, 0);
                 ze_command_queue_desc_t qd{ZE_STYPE_COMMAND_QUEUE_DESC, nullptr, 0, 0, 2, 2, 0};
