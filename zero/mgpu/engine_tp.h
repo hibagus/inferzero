@@ -49,7 +49,7 @@ struct TpComm {
   std::vector<int> half;   // per shard: the half its next part goes to
   std::atomic<int> arrived{0}, gen{0};
   // GPU-side sums (ARC_TP_DEVSYNC=1, 2026-11-18; direct sums of a generated token, tp_reduce_at): no host wait and no
-  // host barrier per sum. Every GPU k holds sem[k][s], one 32-bit word per sender s in its own memory: the number of the
+  // host barrier per sum. Every GPU k holds sem[k][s], one 64-byte slot per sender s in its own memory: the number of the
   // last sum s delivered to it. Sender s copies its part into k's inbox, then (after a barrier on its list, so the copy
   // is done) writes the sum's number into sem[k][s] on its GPU; k's list waits on its GPU until sem[k][s] >= that number
   // for every s, then adds the parts. Intel's memory-semaphore calls (zexCommandListAppendWriteToMemory /
@@ -59,7 +59,10 @@ struct TpComm {
   // The inbox halves stay safe as with the host barrier: s writes half h again two sums later, after its list passed
   // its wait for k's next part, which k sends only after its kernels read half h (k's list is in order).
   bool devsync = false;
-  std::vector<uint32_t*> sem;   // per GPU: n words in its memory
+  std::vector<uint32_t*> sem;   // per GPU: n slots in its memory, slot s at sem[k] + kSemStride * s
+  // (one slot per 64 bytes: the driver writes 8 bytes with a post-sync write, which needs an 8-byte aligned address;
+  // a write to a 4-byte aligned word lands on the 8-byte word below it)
+  static constexpr int kSemStride = 16;
   std::vector<uint32_t> dseq;   // per shard: the number of its last GPU-side sum (the same on every shard)
   // (the driver's zex_wait_on_mem_desc_t / zex_write_to_mem_desc_t, level_zero/driver_experimental/zex_common.h: no
   //  stype / pNext. Scopes: 1 sub-device, 2 device, 4 host; waits: 1 ==, 2 !=, 4 >, 8 >=, 16 <, 32 <=)
@@ -345,10 +348,10 @@ inline void Engine::tp_reduce_at(int rows, const TpSum& a) {
     ZE_CHECK(zeCommandListAppendBarrier(l, nullptr, 0, nullptr));  // (the copies done before the numbers go out)
     TpComm::ZexWrite wd{0x4 /* host scope: visible to the other GPU */};
     for (int k = 0; k < c.n; ++k)
-      if (k != r) ZE_CHECK(c.zex_write(l, &wd, c.sem[k] + r, (uint64_t)q));
+      if (k != r) ZE_CHECK(c.zex_write(l, &wd, c.sem[k] + TpComm::kSemStride * r, (uint64_t)q));
     TpComm::ZexWait wt{0x8 /* greater than or equal */, 0x4 /* host scope */};
     for (int k = 0; k < c.n; ++k)
-      if (k != r) ZE_CHECK(c.zex_wait(l, &wt, c.sem[r] + k, q, nullptr));
+      if (k != r) ZE_CHECK(c.zex_wait(l, &wt, c.sem[r] + TpComm::kSemStride * k, q, nullptr));
   } else {
     const auto t0 = std::chrono::steady_clock::now();
     zrt::sync();
@@ -1330,19 +1333,19 @@ class TpEngine {
           run_on({q}, [&](int r) {
             zrt::oom_throws = true;
             try {
-              comm_.sem[r] = (uint32_t*)zrt::device_alloc(256);
+              comm_.sem[r] = (uint32_t*)zrt::device_alloc((size_t)64 * n);
               const uint32_t z = 0;
-              ZE_CHECK(zeCommandListAppendMemoryFill(zrt::imm(), comm_.sem[r], &z, 4, 256, nullptr, 0, nullptr));
+              ZE_CHECK(zeCommandListAppendMemoryFill(zrt::imm(), comm_.sem[r], &z, 4, (size_t)64 * n, nullptr, 0, nullptr));
               zrt::sync();
               if (getenv("ARC_TP_DEVSYNC_DBG")) {  // (a diagnosis: does a wait on this word build here, and on a new list?)
                 TpComm::ZexWait wt{0x8, 0x4};
                 TpComm::ZexWrite wd{0x4};
-                const ze_result_t a = comm_.zex_wait(zrt::imm(), &wt, comm_.sem[r] + 1, 0, nullptr);
-                const ze_result_t b = comm_.zex_write(zrt::imm(), &wd, comm_.sem[r] + 1, 0);
+                const ze_result_t a = comm_.zex_wait(zrt::imm(), &wt, comm_.sem[r] + TpComm::kSemStride, 0, nullptr);
+                const ze_result_t b = comm_.zex_write(zrt::imm(), &wd, comm_.sem[r] + TpComm::kSemStride, 0);
                 ze_command_queue_desc_t qd{ZE_STYPE_COMMAND_QUEUE_DESC, nullptr, 0, 0, 2, 2, 0};
                 ze_command_list_handle_t nl = nullptr;
                 ze_result_t c2 = zeCommandListCreateImmediate(zrt::ctx, zrt::D().dev, &qd, &nl);
-                if (!c2) c2 = comm_.zex_wait(nl, &wt, comm_.sem[r] + 1, 0, nullptr);
+                if (!c2) c2 = comm_.zex_wait(nl, &wt, comm_.sem[r] + TpComm::kSemStride, 0, nullptr);
                 const ze_result_t sy = zeCommandListHostSynchronize(zrt::imm(), 2000000000ull);
                 zlog::eprintf("inferzero: DEVSYNC_DBG GPU %d: wait on imm 0x%x, write on imm 0x%x, wait on a new list 0x%x, sync 0x%x, batching %d\n",
                               r, a, b, c2, sy, (int)zrt::batching());
