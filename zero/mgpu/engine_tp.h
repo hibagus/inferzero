@@ -48,6 +48,23 @@ struct TpComm {
   size_t half_b = 0;
   std::vector<int> half;   // per shard: the half its next part goes to
   std::atomic<int> arrived{0}, gen{0};
+  // GPU-side sums (ARC_TP_DEVSYNC=1, 2026-11-18; direct sums of a generated token, tp_reduce_at): no host wait and no
+  // host barrier per sum. Every GPU k holds sem[k][s], one 32-bit word per sender s in its own memory: the number of the
+  // last sum s delivered to it. Sender s copies its part into k's inbox, then (after a barrier on its list, so the copy
+  // is done) writes the sum's number into sem[k][s] on its GPU; k's list waits on its GPU until sem[k][s] >= that number
+  // for every s, then adds the parts. Intel's memory-semaphore calls (zexCommandListAppendWriteToMemory /
+  // WaitOnMemory, the driver's extensions oneCCL uses); the numbers only grow, so nothing is reset: events between
+  // GPUs, reset and signalled again a few sums later, hung PVC stacks (driver 25.18) within ~16-128 sums in a
+  // standalone test, the semaphores ran 10,000 sums (5.0 us a sum between a card's stacks, 7.8 between cards).
+  // The inbox halves stay safe as with the host barrier: s writes half h again two sums later, after its list passed
+  // its wait for k's next part, which k sends only after its kernels read half h (k's list is in order).
+  bool devsync = false;
+  std::vector<uint32_t*> sem;   // per GPU: n words in its memory
+  std::vector<uint32_t> dseq;   // per shard: the number of its last GPU-side sum (the same on every shard)
+  struct ZexWait { uint32_t stype; const void* pNext; uint32_t action; };
+  struct ZexWrite { uint32_t stype; const void* pNext; uint32_t scope; };
+  ze_result_t(__stdcall* zex_wait)(ze_command_list_handle_t, ZexWait*, void*, uint32_t, ze_event_handle_t) = nullptr;
+  ze_result_t(__stdcall* zex_write)(ze_command_list_handle_t, ZexWrite*, void*, uint64_t) = nullptr;
   std::atomic<bool> failed{false};  // (a shard threw: the others leave their barrier instead of waiting forever)
   std::atomic<bool> fault{false};   // (a wait gave up on a GPU, barrier or zrt::sync: never in step again, leaked at shutdown)
   std::atomic<int> first_failed{-1};  // (the shard that threw first: its error is the one to report)
@@ -320,10 +337,22 @@ inline void Engine::tp_reduce_at(int rows, const TpSum& a) {
   } else {
     ZE_CHECK(zeCommandListAppendMemoryCopy(zrt::imm(), c.host + off + (size_t)r * stride, a.part->ptr, n * 4, nullptr, 0, nullptr));
   }
-  const auto t0 = std::chrono::steady_clock::now();
-  zrt::sync();
-  c.barrier(opt.tp_rank);
-  c.wait_ms[r] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  if (p2p && c.devsync) {  // (ARC_TP_DEVSYNC: the GPUs meet on their own, TpComm::devsync)
+    const uint32_t q = ++c.dseq[r];
+    ze_command_list_handle_t l = zrt::imm();
+    ZE_CHECK(zeCommandListAppendBarrier(l, nullptr, 0, nullptr));  // (the copies done before the numbers go out)
+    TpComm::ZexWrite wd{0, nullptr, 0x4 /* host scope: visible to the other GPU */};
+    for (int k = 0; k < c.n; ++k)
+      if (k != r) ZE_CHECK(c.zex_write(l, &wd, c.sem[k] + r, (uint64_t)q));
+    TpComm::ZexWait wt{0, nullptr, 0x8 /* greater than or equal */};
+    for (int k = 0; k < c.n; ++k)
+      if (k != r) ZE_CHECK(c.zex_wait(l, &wt, c.sem[r] + k, q, nullptr));
+  } else {
+    const auto t0 = std::chrono::steady_clock::now();
+    zrt::sync();
+    c.barrier(opt.tp_rank);
+    c.wait_ms[r] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  }
   ++c.reduces[r];
   int nn = (int)n, np = c.n;
   if (p2p) tp_inbox_fence(c, r, h);
@@ -1279,6 +1308,43 @@ class TpEngine {
     }
     comm_.p2p = use;
     zlog::eprintf("inferzero: the GPUs' sums go %s (%s)\n", use ? "straight from GPU to GPU" : "through host memory", why.c_str());
+    // ARC_TP_DEVSYNC=1: a generated token's sums meet on the GPUs (TpComm::devsync). Direct sums on distinct GPUs only
+    // (one GPU's lists waiting on each other can deadlock, tpo_wait). Off unless asked.
+    if (const char* ds = getenv("ARC_TP_DEVSYNC"); ds && atoi(ds) != 0 && use && !sim && n > 1) {
+      const char* no = nullptr;
+      typedef ze_result_t(__stdcall * PFN_ext)(ze_driver_handle_t, const char*, void**);
+      void* zl = plat::dl_loaded("ze_loader.dll", "libze_loader.so.1");
+      auto ext = zl ? (PFN_ext)plat::dl_sym(zl, "zeDriverGetExtensionFunctionAddress") : nullptr;
+      void *pw = nullptr, *pr = nullptr;
+      if (!ext || ext(zrt::driver, "zexCommandListAppendWaitOnMemory", &pw) != 0 || !pw ||
+          ext(zrt::driver, "zexCommandListAppendWriteToMemory", &pr) != 0 || !pr)
+        no = "this driver has no zexCommandListAppendWaitOnMemory / WriteToMemory";
+      if (!no) {
+        comm_.zex_wait = (decltype(comm_.zex_wait))pw;
+        comm_.zex_write = (decltype(comm_.zex_write))pr;
+        comm_.sem.assign(n, nullptr);
+        comm_.dseq.assign(n, 0);
+        for (int q = 0; q < n; ++q)  // (one GPU at a time, as above)
+          run_on({q}, [&](int r) {
+            zrt::oom_throws = true;
+            try {
+              comm_.sem[r] = (uint32_t*)zrt::device_alloc(256);
+              const uint32_t z = 0;
+              ZE_CHECK(zeCommandListAppendMemoryFill(zrt::imm(), comm_.sem[r], &z, 4, 256, nullptr, 0, nullptr));
+              zrt::sync();
+            } catch (...) {}
+            zrt::oom_throws = false;
+          }, false, false);
+        if (!std::all_of(comm_.sem.begin(), comm_.sem.end(), [](uint32_t* p) { return p != nullptr; })) {
+          for (uint32_t* p : comm_.sem)
+            if (p) zrt::mem_free(zrt::ctx, p);
+          comm_.sem.clear();
+          no = "no GPU memory for the semaphores";
+        }
+      }
+      comm_.devsync = !no;
+      zlog::eprintf("inferzero: ARC_TP_DEVSYNC: %s\n", no ? no : "a generated token's sums meet on the GPUs (memory semaphores)");
+    }
     // (a slow link: the prompt's sums wait on it; docs/multi-gpu.md says what helps)
     const double eff = use ? direct : host;
     if (timed && eff < 4.0)
