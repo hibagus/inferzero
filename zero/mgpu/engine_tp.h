@@ -1332,6 +1332,19 @@ class TpEngine {
               const uint32_t z = 0;
               ZE_CHECK(zeCommandListAppendMemoryFill(zrt::imm(), comm_.sem[r], &z, 4, 256, nullptr, 0, nullptr));
               zrt::sync();
+              if (getenv("ARC_TP_DEVSYNC_DBG")) {  // (a diagnosis: does a wait on this word build here, and on a new list?)
+                TpComm::ZexWait wt{0, nullptr, 0x8};
+                TpComm::ZexWrite wd{0, nullptr, 0x4};
+                const ze_result_t a = comm_.zex_wait(zrt::imm(), &wt, comm_.sem[r] + 1, 0, nullptr);
+                const ze_result_t b = comm_.zex_write(zrt::imm(), &wd, comm_.sem[r] + 1, 0);
+                ze_command_queue_desc_t qd{ZE_STYPE_COMMAND_QUEUE_DESC, nullptr, 0, 0, 2, 2, 0};
+                ze_command_list_handle_t nl = nullptr;
+                ze_result_t c2 = zeCommandListCreateImmediate(zrt::ctx, zrt::D().dev, &qd, &nl);
+                if (!c2) c2 = comm_.zex_wait(nl, &wt, comm_.sem[r] + 1, 0, nullptr);
+                const ze_result_t sy = zeCommandListHostSynchronize(zrt::imm(), 2000000000ull);
+                zlog::eprintf("inferzero: DEVSYNC_DBG GPU %d: wait on imm 0x%x, write on imm 0x%x, wait on a new list 0x%x, sync 0x%x, batching %d\n",
+                              r, a, b, c2, sy, (int)zrt::batching());
+              }
             } catch (...) {}
             zrt::oom_throws = false;
           }, false, false);
