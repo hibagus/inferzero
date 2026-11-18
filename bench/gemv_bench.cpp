@@ -11,6 +11,7 @@
 #include "../src/clrt.h"
 #include "../src/quants.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <random>
 
@@ -81,7 +82,9 @@ int main(int argc, char** argv) {
   // (small-block types with K % 256 != 0, Qwen3.8 Flash Next's K = 640 down projections: rows padded with zero
   //  blocks to the next multiple of 256, the activations with zeros, as the engine does)
   const int K0 = (int)ts[0]->dims[0], K = is_small_block_type(type) ? padded_k(K0) : K0;
-  const int N = (int)ts[0]->dims[1], nsb = K / 256, M = 16;
+  // (GB_N=n: only the first n rows of each matrix, the share of one GPU of a model split by rows)
+  const int N = getenv("GB_N") ? std::min((int)ts[0]->dims[1], atoi(getenv("GB_N"))) : (int)ts[0]->dims[1];
+  const int nsb = K / 256, M = 16;
   std::vector<std::vector<uint8_t>> padded_src(ts.size());
   if (K != K0)
     for (size_t i = 0; i < ts.size(); ++i) {
@@ -271,5 +274,15 @@ int main(int argc, char** argv) {
   const double med = per[per.size() / 2], bytes = (double)N * nsb * bb;
   printf("median %.3f ms per matrix (min %.3f) -> %.1f GB/s of weights%s\n", med, per[0], bytes / med / 1e6,
          mt ? (" (" + std::to_string(T) + " tokens per read)").c_str() : "");
+  {  // back to back without events: the time per launch with the gaps between kernels, as in token generation
+    CL_CHECK(clFinish(cl.queue));
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int it = 0; it < iters; ++it)
+      for (auto r : rawk) launch(r, nullptr);
+    CL_CHECK(clFinish(cl.queue));
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() /
+                      ((double)iters * rawk.size());
+    printf("back to back: %.3f ms per launch (%.1f GB/s)\n", ms, bytes / ms / 1e6);
+  }
   return 0;
 }
