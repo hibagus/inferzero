@@ -54,8 +54,8 @@ struct TpComm {
   // is done) writes the sum's number into sem[k][s] on its GPU; k's list waits on its GPU until sem[k][s] >= that number
   // for every s, then adds the parts. Intel's memory-semaphore calls (zexCommandListAppendWriteToMemory /
   // WaitOnMemory, the driver's extensions oneCCL uses); the numbers only grow, so nothing is reset: events between
-  // GPUs, reset and signalled again a few sums later, hung PVC stacks (driver 25.18) within ~16-128 sums in a
-  // standalone test, the semaphores ran 10,000 sums (5.0 us a sum between a card's stacks, 7.8 between cards).
+  // GPUs, reset and signalled again a few sums later, hung PVC stacks (driver 25.18) within a few hundred sums in a
+  // standalone test; the semaphores did not.
   // The inbox halves stay safe as with the host barrier: s writes half h again two sums later, after its list passed
   // its wait for k's next part, which k sends only after its kernels read half h (k's list is in order).
   bool devsync = false;
