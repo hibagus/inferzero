@@ -475,6 +475,12 @@ inline void* host_alloc(size_t n) {
       LOG_ERR("inferzero: ARC_HOST_DIAG: zeMemAllocHost of %zu bytes failed (0x%x), try %d; before it %zu "
               "allocations of %zu bytes in all\n", n, (unsigned)e, a, count.load(), bytes.load());
 #ifndef _WIN32
+      {
+        std::ifstream mf("/proc/self/maps");
+        size_t lines = 0;
+        for (std::string l; std::getline(mf, l);) ++lines;
+        LOG_ERR("inferzero: ARC_HOST_DIAG: %zu memory mappings in this process\n", lines);
+      }
       void* bt[24];
       backtrace_symbols_fd(bt, backtrace(bt, 24), 2);
 #endif
