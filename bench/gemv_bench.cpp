@@ -71,6 +71,8 @@ int main(int argc, char** argv) {
       const GgufTensor* tp = g.find(nm);
       if (!tp) { if (l > 64) break; continue; }
       const GgufTensor& t = *tp;
+      // (GB_TYPE=n: only tensors of ggml type n, e.g. a mixed-type model's main type)
+      if (getenv("GB_TYPE") && (int)t.type != atoi(getenv("GB_TYPE"))) continue;
       if (!ts.empty() && (t.type != ts[0]->type || t.dims != ts[0]->dims)) continue;  // one type and shape per run
       ts.push_back(&t);
     }

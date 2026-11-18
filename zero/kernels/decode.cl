@@ -1390,7 +1390,15 @@ __kernel void gemv_v(__global const uchar* raw, int N, int K, __global const uin
   __local uint kt[VB_TABLES];
   vb_tables(kt, tabs);
   const int lane = get_sub_group_local_id();
+#ifdef SPLITK
+  // (-DSPLITK=S as in gemv: S sub-groups share a row group, each taking every S-th step; sums added in a fixed order)
+  const int kj = (int)(get_global_id(0) / 16) % SPLITK;
+  int r0 = (int)((get_global_id(0) / 16) / SPLITK) * GROWS;
+  const int sk0 = 2 * kj, sks = 2 * SPLITK;
+#else
   int r0 = (get_global_id(0) / 16) * GROWS;
+  const int sk0 = 0, sks = 2;
+#endif
   GU2_SWITCH(r0)
   const int nsb = K / 256, ib = lane % 8, hs = lane / 8;
   float acc[GROWS];
@@ -1401,7 +1409,7 @@ __kernel void gemv_v(__global const uchar* raw, int N, int K, __global const uin
 #pragma unroll
   for (int r = 0; r < GROWS; ++r) acc2[r] = 0.0f;
 #endif
-  for (int sp = 0; sp < nsb; sp += 2) {
+  for (int sp = sk0; sp < nsb; sp += sks) {
     const int b = sp * 8 + lane;
     const bool has = sp + hs < nsb;
     const int s = has ? sp + hs : sp;
@@ -1446,12 +1454,33 @@ __kernel void gemv_v(__global const uchar* raw, int N, int K, __global const uin
     const float v = sub_group_reduce_add(acc[r]), v2 = sub_group_reduce_add(acc2[r]);
     const int n = r0 + r;
     if (lane == 0 && n < N) Q2F_STORE(n, v, v2);
+#elif defined(SPLITK)
+    acc[r] = sub_group_reduce_add(acc[r]);
 #else
     const float v = HEAD_OUT(sub_group_reduce_add(acc[r]));
     const int n = r0 + r;
     if (lane == 0 && n < N) C[c_off + n] = accumulate ? C[c_off + n] + v : v;
 #endif
   }
+#if defined(SPLITK) && !defined(Q2F)
+  __local float part[16][GROWS];
+  const int sg = get_sub_group_id() & 15;
+  if (lane == 0) {
+#pragma unroll
+    for (int r = 0; r < GROWS; ++r) part[sg][r] = acc[r];
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (kj == 0 && lane == 0) {
+#pragma unroll
+    for (int r = 0; r < GROWS; ++r) {
+      float t = part[sg][r];
+      for (int j = 1; j < SPLITK; ++j) t += part[sg + j][r];
+      const float v = HEAD_OUT(t);
+      const int n = r0 + r;
+      if (n < N) C[c_off + n] = accumulate ? C[c_off + n] + v : v;
+    }
+  }
+#endif
 }
 #ifndef TB
 #define TB 2

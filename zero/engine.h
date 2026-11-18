@@ -1171,8 +1171,8 @@ __kernel void rd_block(__global const uint* p, __global uint* out, int per_item)
   // other, which sets the GEMV's floor once a launch has few rows (a GPU's share of a split model, a long-row down
   // projection), and a launch of just over one round of the GPU's T threads pays a second round. So: of G in {1, 2, 4}
   // and S in {1, 2, 4, 8} (S at most the row's steps), the most sub-groups N / G x S that fit in one round of T; ties
-  // to the larger S, then the larger G. Where nothing fits (N > 4T) G = 1, S = 1, as the wave rule. gemv only (not
-  // gemv_v's types), one token, not the fused two-pass GEMV or the probes; ARC_GEMV_ROWS overrides it
+  // to the larger S, then the larger G. Where nothing fits (N > 4T) G = 1, S = 1, as the wave rule. gemv and gemv_v,
+  // one token, not the output head, the fused two-pass GEMV or the probes; ARC_GEMV_ROWS overrides it
   bool gemv_splitk(const GpuWeight& w, int& grows, int& split) const {
     static const bool on = getenv("ARC_GEMV_SPLITK") && atoi(getenv("ARC_GEMV_SPLITK")) != 0;
     const int t = on && !getenv("ARC_GEMV_ROWS") ? (int)zrt::hw_threads() : 0;
@@ -1218,7 +1218,7 @@ __kernel void rd_block(__global const uint* p, __global uint* out, int per_item)
       static const int gv_probe = getenv("ARC_GV_PROBE") ? atoi(getenv("ARC_GV_PROBE")) : 0;
       const std::string probe_def = gv_probe && !vk && &w != &lm_head_ ? " -DGV_PROBE=" + std::to_string(gv_probe) : std::string();
       int grows = grows0, split = 1;
-      if (!vk && !q2_fuse_ && probe_def.empty() && !gemv_splitk(w, grows, split)) grows = grows0;
+      if (!q2_fuse_ && probe_def.empty() && &w != &lm_head_ && !gemv_splitk(w, grows, split)) grows = grows0;
       const std::string split_def = split > 1 ? " -DSPLITK=" + std::to_string(split) : std::string();
       cl_kernel k = kernel("decode", xe2_gemv_grf() + "-DQT=" + std::to_string(w.type) + " -DGROWS=" + std::to_string(grows) + head_defs(w) + probe_def + split_def +
                                          (q2_fuse_ ? " -DQ2F" + q2_defs_ : std::string()) + (vk ? std::string() : xe2_gemv_pf()),
