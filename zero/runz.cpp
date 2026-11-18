@@ -85,7 +85,7 @@ static std::string peak_note(Engine& eng, double gbs) {
 
 // --gpus N: the model split over N GPUs (zero/engine_tp.h): the prompt (or --bench-pp N), then greedy generation
 static int run_tp(const std::string& model, const EngineOptions& eo, int gpus, const std::vector<int>& toks, int n_gen,
-                  int bench_pp, const std::string& dump_logits, bool show, const std::string& kl_ref, int bench_batch) {
+                  int bench_pp, const std::string& dump_logits, bool show, const std::string& kl_ref, int bench_batch, bool prof_gen = false) {
   TpEngine tp(model, eo, gpus);
   Engine& e0 = tp.shard(0);
   Vocab vocab(e0.gguf());
@@ -249,6 +249,12 @@ static int run_tp(const std::string& model, const EngineOptions& eo, int gpus, c
   if (bench_pp > 0) tok = 1000;
   std::vector<int> gen;
   std::vector<double> step_ms;
+  if (prof_gen)  // (--prof-gen: every GPU's kernel times over the generated tokens, printed per GPU below)
+    for (int r = 0; r < gpus; ++r) {
+      tp.shard(r).prof_ms.clear();
+      tp.shard(r).prof_n.clear();
+      tp.shard(r).profile = true;
+    }
   const uint64_t b0 = read_bytes();
   const auto [w0, n0] = syncs();
   const auto t1 = std::chrono::steady_clock::now();
@@ -278,6 +284,22 @@ static int run_tp(const std::string& model, const EngineOptions& eo, int gpus, c
     const double gb = (read_bytes() - b0) / 1e9;
     printf("weights read: %.0f MB per token over %d GPUs, %.1f GB/s together\n", gb * 1000 / step_ms.size(), gpus, gb / gms * 1000);
   }
+  if (prof_gen && !step_ms.empty())
+    for (int r = 0; r < gpus; ++r) {
+      Engine& s = tp.shard(r);
+      s.profile = false;
+      double total = 0;
+      std::vector<std::pair<double, std::string>> rows;
+      for (auto& [n, ms] : s.prof_ms) {
+        total += ms;
+        rows.push_back({ms, n});
+      }
+      std::sort(rows.rbegin(), rows.rend());
+      printf("GPU %d time by kernel over %zu tokens: total %.1f ms (%.2f ms per token)\n", r, step_ms.size(), total,
+             total / step_ms.size());
+      for (auto& [ms, n] : rows)
+        printf("  %-20s %8.2f ms  %5.1f%%  (%d launches)\n", n.c_str(), ms, 100 * ms / total, s.prof_n[n]);
+    }
   if (show) printf("----- text -----\n%s\n----------------\n", vocab.decode(gen).c_str());
   return 0;
 }
@@ -473,7 +495,7 @@ static int run_main(int argc, char** argv) {
   warn_gpu_neighbours();
   if (gpus > 1) {
     if (bench_batch > 1) eo.slots = std::min(bench_batch, Engine::kMaxSlots);  // (a split model's slots: made at load)
-    return run_tp(model, eo, gpus, toks, n_gen, bench_pp, dump_logits, show, kl_ref, bench_batch);
+    return run_tp(model, eo, gpus, toks, n_gen, bench_pp, dump_logits, show, kl_ref, bench_batch, prof_gen);
   }
   Engine eng(model, eo);
   // (every position's logits are read after the prompt: no 8-token passes, see Engine::keep_rows; a reference of
