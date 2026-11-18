@@ -1135,6 +1135,10 @@ __kernel void rd_block(__global const uint* p, __global uint* out, int per_item)
     static const bool gv_iq3s = getenv("ARC_GV_IQ3S") && atoi(getenv("ARC_GV_IQ3S")) != 0;
     vk = gemv_v_ok(w) || (gv_iq3s && w.type == GGML_IQ3_S);
     // (discrete cards: rows by the GPU's thread count, zero/xe2/engine_xe2.h xe2_gemv_rows)
+    // (ARC_GEMV_ROWS=n, a test: n rows per sub-group for gemv's single-token GEMVs of up to 65,536 rows, the rules
+    //  above and below off for them; bit-identical, a row's sums do not depend on its sub-group)
+    static const int force_rows = getenv("ARC_GEMV_ROWS") ? atoi(getenv("ARC_GEMV_ROWS")) : 0;
+    if (force_rows > 0 && !vk && w.N <= 65536) return force_rows;
     return xe2_gemv_rows(w, vk ? gemv_v_rows(w) : w.N <= 4096 ? 1 : w.N <= 8192 ? 2 : w.N <= 65536 ? 4 : 2);
   }
   // One token: the FFN's gate and up GEMVs in one launch (decode.cl -DGU2, QUEUE 33.5): rows [0, F) of gate and
