@@ -902,7 +902,17 @@ __kernel void gemv(__global const uchar* raw, int N, int K, __global const uint*
 #endif
   barrier(CLK_LOCAL_MEM_FENCE);
   const int lane = get_sub_group_local_id();
+#ifdef SPLITK
+  // -DSPLITK=S (a prototype, 2026-11-18): S sub-groups of one work-group share a row group, sub-group j taking the
+  // steps j, j + S, ... of its rows; their sums meet in local memory and are added in a fixed order (deterministic,
+  // but not the unsplit kernel's order). S divides 16; the launch has S times the lanes
+  const int kj = (int)(get_global_id(0) / 16) % SPLITK;
+  int r0 = (int)((get_global_id(0) / 16) / SPLITK) * GROWS;
+  const int sk0 = 2 * kj, sks = 2 * SPLITK;
+#else
   int r0 = (get_global_id(0) / 16) * GROWS;
+  const int sk0 = 0, sks = 2;
+#endif
   GU2_SWITCH(r0)
   const int nsb = K / 256;
   float acc[GROWS];
@@ -916,12 +926,12 @@ __kernel void gemv(__global const uchar* raw, int N, int K, __global const uint*
 #ifdef GEMV_DB
   uint nxt[WIN_CALLS];  // (the next window's words: step 0, row 0 first)
   {
-    __global const uint* src = (__global const uint*)(raw + ((size_t)min(r0, N - 1) * nsb) * BBP);
+    __global const uint* src = (__global const uint*)(raw + ((size_t)min(r0, N - 1) * nsb + min(sk0, nsb - 1)) * BBP);
 #pragma unroll
     for (int c = 0; c < WIN_CALLS; ++c) nxt[c] = intel_sub_group_block_read(src + c * 16);
   }
 #endif
-  for (int sp = 0; sp < nsb; sp += 2) {
+  for (int sp = sk0; sp < nsb; sp += sks) {
     const int b = sp * 8 + lane;  // this lane's 32-block within the row
     const bool has = sp + lane / 8 < nsb;
     const uint8 a8 = has ? vload8(0, (__global const uint*)(aq + 32 * b)) : (uint8)0;
@@ -962,7 +972,7 @@ __kernel void gemv(__global const uchar* raw, int N, int K, __global const uint*
       for (int c = 0; c < WIN_CALLS; ++c) win[c * 16 + lane] = nxt[c];
       {
         // the window after this one: row r + 1 of this step, or row 0 of the next step (none after the last)
-        const int nr = r + 1 < GROWS ? r + 1 : 0, nsp = r + 1 < GROWS ? sp : sp + 2;
+        const int nr = r + 1 < GROWS ? r + 1 : 0, nsp = r + 1 < GROWS ? sp : sp + sks;
         if (nsp < nsb) {
           __global const uint* src = (__global const uint*)(raw + ((size_t)min(r0 + nr, N - 1) * nsb + nsp) * BBP);
 #pragma unroll
@@ -1028,12 +1038,33 @@ __kernel void gemv(__global const uchar* raw, int N, int K, __global const uint*
     const float v = sub_group_reduce_add(acc[r]), v2 = sub_group_reduce_add(acc2[r]);
     const int n = r0 + r;
     if (lane == 0 && n < N) Q2F_STORE(n, v, v2);
+#elif defined(SPLITK)
+    acc[r] = sub_group_reduce_add(acc[r]);
 #else
     const float v = HEAD_OUT(sub_group_reduce_add(acc[r]));
     const int n = r0 + r;
     if (lane == 0 && n < N) C[c_off + n] = accumulate ? C[c_off + n] + v : v;
 #endif
   }
+#if defined(SPLITK) && !defined(Q2F)
+  __local float part[16][GROWS];
+  const int sg = get_sub_group_id() & 15;
+  if (lane == 0) {
+#pragma unroll
+    for (int r = 0; r < GROWS; ++r) part[sg][r] = acc[r];
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (kj == 0 && lane == 0) {
+#pragma unroll
+    for (int r = 0; r < GROWS; ++r) {
+      float t = part[sg][r];
+      for (int j = 1; j < SPLITK; ++j) t += part[sg + j][r];
+      const float v = HEAD_OUT(t);
+      const int n = r0 + r;
+      if (n < N) C[c_off + n] = accumulate ? C[c_off + n] + v : v;
+    }
+  }
+#endif
 }
 
 #if VB_TYPE || defined(GRID_OFF)
