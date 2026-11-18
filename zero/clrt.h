@@ -19,6 +19,10 @@
 #include <stdexcept>
 #include <fstream>
 #include <mutex>
+#include <thread>
+#ifndef _WIN32
+#include <execinfo.h>
+#endif
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -450,15 +454,42 @@ inline ze_event_handle_t ev_get() {
   D().ev_free.pop_back();
   return e;
 }
+// (ARC_HOST_DIAG=1, a diagnosis of zeMemAllocHost's intermittent out-of-memory on PVC with several GPUs, 2026-11-18:
+//  every failure is logged with its size, the allocations so far and the call stack; ARC_HOST_ALLOC_LOCK=1 makes
+//  the allocations one at a time across threads; ARC_HOST_ALLOC_RETRY=n tries n times more, 50 ms apart)
 inline void* host_alloc(size_t n) {
   ze_host_mem_alloc_desc_t hd{ZE_STYPE_HOST_MEM_ALLOC_DESC, nullptr, 0};
   void* p = nullptr;
-  if (oom_throws) {
-    if (zeMemAllocHost(ctx, &hd, n, 4096, &p) != ZE_RESULT_SUCCESS)
-      throw std::runtime_error("host allocation of " + std::to_string(n >> 20) + " MB failed");
+  static const bool diag = getenv("ARC_HOST_DIAG") && atoi(getenv("ARC_HOST_DIAG")) != 0;
+  static const bool lock = getenv("ARC_HOST_ALLOC_LOCK") && atoi(getenv("ARC_HOST_ALLOC_LOCK")) != 0;
+  static const int retries = getenv("ARC_HOST_ALLOC_RETRY") ? atoi(getenv("ARC_HOST_ALLOC_RETRY")) : 0;
+  static std::mutex mu;
+  static std::atomic<size_t> count{0}, bytes{0};
+  std::unique_lock<std::mutex> g(mu, std::defer_lock);
+  if (lock) g.lock();
+  ze_result_t e = ZE_RESULT_SUCCESS;
+  for (int a = 0;; ++a) {
+    e = zeMemAllocHost(ctx, &hd, n, 4096, &p);
+    if (e == ZE_RESULT_SUCCESS) break;
+    if (diag) {
+      LOG_ERR("inferzero: ARC_HOST_DIAG: zeMemAllocHost of %zu bytes failed (0x%x), try %d; before it %zu "
+              "allocations of %zu bytes in all\n", n, (unsigned)e, a, count.load(), bytes.load());
+#ifndef _WIN32
+      void* bt[24];
+      backtrace_symbols_fd(bt, backtrace(bt, 24), 2);
+#endif
+    }
+    if (a >= retries) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  if (e == ZE_RESULT_SUCCESS) {
+    ++count;
+    bytes += n;
+    if (diag && n >= ((size_t)256 << 20)) LOG_ERR("inferzero: ARC_HOST_DIAG: host allocation of %zu MB\n", n >> 20);
     return p;
   }
-  ZE_CHECK(zeMemAllocHost(ctx, &hd, n, 4096, &p));
+  if (oom_throws) throw std::runtime_error("host allocation of " + std::to_string(n >> 20) + " MB failed");
+  ZE_CHECK(e);
   return p;
 }
 inline char* staging(size_t n) {
