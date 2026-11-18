@@ -83,17 +83,26 @@ int main(int argc, char** argv) {
   const uint32_t type = ts[0]->type;
   // (small-block types with K % 256 != 0, Qwen3.8 Flash Next's K = 640 down projections: rows padded with zero
   //  blocks to the next multiple of 256, the activations with zeros, as the engine does)
-  const int K0 = (int)ts[0]->dims[0], K = is_small_block_type(type) ? padded_k(K0) : K0;
+  const int K0 = (int)ts[0]->dims[0], Kp = is_small_block_type(type) ? padded_k(K0) : K0;
+  // (GB_K=k: only the first k columns of each row (a multiple of 256, 256-value superblock types), the share of one
+  //  GPU of a model split along the rows' length, e.g. the FFN down projection's)
+  const int K = getenv("GB_K") && !is_small_block_type(type) ? std::min(Kp, atoi(getenv("GB_K")) / 256 * 256) : Kp;
   // (GB_N=n: only the first n rows of each matrix, the share of one GPU of a model split by rows)
   const int N = getenv("GB_N") ? std::min((int)ts[0]->dims[1], atoi(getenv("GB_N"))) : (int)ts[0]->dims[1];
   const int nsb = K / 256, M = 16;
   std::vector<std::vector<uint8_t>> padded_src(ts.size());
-  if (K != K0)
+  if (Kp != K0)
     for (size_t i = 0; i < ts.size(); ++i) {
       int blk = 0, bytes = 0;
       ggml_block_info(type, blk, bytes);
       padded_src[i].resize((size_t)N * (K / blk) * bytes);
       pad_small_block_rows(type, ts[i]->data, N, K0, padded_src[i].data());
+    }
+  if (K < K0 && !is_small_block_type(type))
+    for (size_t i = 0; i < ts.size(); ++i) {
+      const size_t sb = gguf_sb_bytes(type), full = (size_t)(K0 / 256) * sb, part = (size_t)(K / 256) * sb;
+      padded_src[i].resize((size_t)N * part);
+      for (int n = 0; n < N; ++n) memcpy(padded_src[i].data() + n * part, ts[i]->data + n * full, part);
     }
   auto src_of = [&](size_t i) { return K != K0 ? padded_src[i].data() : ts[i]->data; };
   const size_t bb = gguf_sb_bytes(type), bp = raw_padded_sb_bytes(type);
