@@ -63,6 +63,10 @@
 #error "XW_NC must be 1, 2, 4, 6 or 8"
 #endif
 #define XW_TG (XW_TM / 8)  // DPAS row groups of 8 tokens
+// -DXW_C_RND (with XW_2D_C): the add mode's product rounded to f32 before `+ old`, not fused with it into a mad (an OR
+// with M >> 30, 0 but unknown to the compiler). A compiler that fuses the 2D epilogue's add and not gemm.cl's (a Data
+// Center GPU Max 1550, driver 25.18) fails the start check in the add modes by 1-6 ulp; with this the values are
+// gemm.cl's again (engine_xw.h xw_init)
 // -DXW_PF=1 / 2 / 3 (2026-11-13, B60 prefill plan 13.2): prefetch into L1 the weights (1), the activations (2, with
 // X2D) or both (3) of the 64-value chunk XW_PFD chunks ahead (1, 2 or 4). The prefetches go to L1 only: the values
 // read, and so the results, are the same bit for bit
@@ -243,7 +247,11 @@ __kernel void gemm_xw(__global const uint* restrict wq, __global const uint* res
           const float res = BCAST(av[m / 16], m % 16) * dcol * (float)is[r];
           float v = res;
           if (accumulate == 1) {
+#ifdef XW_C_RND
+            v = as_float(as_uint(res) | (uint)(M >> 30)) + as_float(old[r]);
+#else
             v += as_float(old[r]);
+#endif
           } else if (accumulate == 2) {
             const float gt = as_float(old[r]);
             v *= gt / (1.0f + exp(-gt));

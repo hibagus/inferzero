@@ -176,6 +176,11 @@
   // the plain form the epilogue is gemm.cl's code again
   bool xw_2d_discrete_ = false;
   int xw_2d_fb_ = 0;  // (the start check's fallback: 0 none, 1 C's 2D form dropped, 2 the 2D form dropped)
+  // (C in 2D blocks failing the start check in the add modes: tried once more with gemm_xw.cl -DXW_C_RND, the product
+  //  rounded before the add, before the 2D form is dropped. A Data Center GPU Max 1550 (driver 25.18) fails by 1-6 ulp
+  //  there and passes with it: the 27B 4K prompt on one stack 2,460 -> 2,638 tok/s, logits identical to the plain
+  //  form's. ARC_GEMM_XW_C_RND=1: from the start, =0: never)
+  bool xw_c_rnd_ = false;
   int xw_2d_level() const {  // (0 off, 1 the loads and C, 2 the loads only, before the fallback)
     static const char* e = getenv("ARC_GEMM_XW_2D");
     const int v = e ? std::clamp(atoi(e), 0, 2) : (xw_2d_discrete_ ? 1 : 0);
@@ -197,7 +202,7 @@
     // (not the 32 x 96 tiles (NC 6): with the 2D form they spill 2 KB, ocloc bmg / ptl; 32 x 64 none, 489 -> 77 sends)
     const bool d2 = (nc ? nc : xw_nc()) != 6;
     return kernel("xw", defs + (x2d_ && !xw_emu_ ? " -DX2D" : "") + (xw_2d() && d2 ? " -DXW_2D" : "") +
-                            (xw_2d_c() && d2 ? " -DXW_2D_C" : ""),
+                            (xw_2d_c() && d2 ? " -DXW_2D_C" : "") + (xw_2d_c() && d2 && xw_c_rnd_ ? " -DXW_C_RND" : ""),
                   "gemm_xw");
   }
   // one piece [s0, s1) of K over N columns from 16-column group g_base (16 lanes; 0 on 8): the grid of gemm_xw.cl's /
@@ -274,10 +279,24 @@
                             (xw_lock() ? "|lock" : "") + (xw_2d() ? "|xw2d" : "") + (xw_2d_c() ? "c" : "");
     std::lock_guard<std::mutex> g(mu);
     static std::map<std::string, int> fb2d;  // (per key: the 2D fallback its check ended at, then checked that way)
+    static std::map<std::string, bool> crnd;  // (per key: whether its check ended with XW_C_RND)
     if (fb2d.count(key)) xw_2d_fb_ = fb2d[key];
+    if (crnd.count(key)) xw_c_rnd_ = crnd[key];
     auto it = known.find(key);
     if (it == known.end()) {
+      static const char* rnd_env = getenv("ARC_GEMM_XW_C_RND");
+      xw_c_rnd_ = rnd_env && atoi(rnd_env) != 0;
+      crnd[key] = xw_c_rnd_;
       bool ok = xw_check();
+      // (C in 2D blocks failing: once more with the add's product rounded first, unless asked not to)
+      if (!ok && xw_2d_c() && !xw_c_rnd_ && !(rnd_env && atoi(rnd_env) == 0)) {
+        xw_c_rnd_ = true;
+        ok = xw_check();
+        zlog::eprintf("inferzero: ARC_GEMM_XW_2D: C in 2D blocks with the add's product rounded first (XW_C_RND): %s\n",
+                      ok ? "the same as gemm.cl, used" : "differs too");
+        if (!ok) xw_c_rnd_ = false;
+        crnd[key] = xw_c_rnd_;
+      }
       // (a 2D form that differs or does not build: the plain form, checked again. The loads alone (=2) only when asked
       //  for: on the B60 under Windows whose full form failed, they gave 1,705 tok/s against the plain form's 1,726 on
       //  the 27B's 4K prompt, logits equal (manoreken2, issue #4, release .08))
@@ -410,7 +429,20 @@
             }
             if (!sane || memcmp(out[0].data(), out[1].data(), c0.size() * 4)) {
               size_t diff = 0;
-              for (size_t i = 0; i < c0.size(); ++i) diff += memcmp(&out[0][i], &out[1][i], 4) != 0;
+              // (ARC_GEMM_XW_DIAG=1: the first few differences, by how many ulp: a rounding or a wrong value)
+              static const bool diag = getenv("ARC_GEMM_XW_DIAG") && atoi(getenv("ARC_GEMM_XW_DIAG")) != 0;
+              int shown = 0;
+              for (size_t i = 0; i < c0.size(); ++i) {
+                const bool d = memcmp(&out[0][i], &out[1][i], 4) != 0;
+                diff += d;
+                if (d && diag && shown < 6) {
+                  int32_t a, b;
+                  memcpy(&a, &out[0][i], 4), memcpy(&b, &out[1][i], 4);
+                  zlog::eprintf("inferzero: ARC_GEMM_XW_DIAG %dx%d mode %d wgy %d: row %zu col %zu: gemm.cl %.9g gemm_xw %.9g "
+                                "(C before %.9g, %d ulp)\n", M, N, mode, wgy, i / ldc, i % ldc, out[0][i], out[1][i], c0[i], b - a);
+                  ++shown;
+                }
+              }
               bad += " " + std::to_string(M) + "x" + std::to_string(N) + "/" +
                      (mode == 0 ? "store" : mode == 1 ? "split" : mode == 2 ? "add" : "swiglu") + "/wgy" +
                      std::to_string(wgy) + (form ? "/pack" + std::to_string(form) : std::string()) + "(" +
